@@ -1,0 +1,1715 @@
+diff --git a/arch/x86/Gconfig.aslr b/arch/x86/Gconfig.aslr
+index 72d9eb0..cd7f99e 100644
+--- a/arch/x86/Gconfig.aslr
++++ b/arch/x86/Gconfig.aslr
+@@ -2,4 +2,4 @@ CONFIG_RANDOMIZE_BASE=y
+ CONFIG_RANDOMIZE_BASE_MAX_OFFSET=0x40000000
+ CONFIG_PHYSICAL_ALIGN=0x200000
+ CONFIG_PHYSICAL_START=0x1000000
+-CONFIG_KASLR_DEFAULT_ENABLED=y
++# CONFIG_KASLR_DEFAULT_ENABLED is not set
+diff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
+index 90cf8db4..a4c84f3 100644
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -87,6 +87,35 @@ extern struct mm_struct *pgd_page_get_mm(struct page *page);
+  * The following only work if pte_present() is true.
+  * Undefined behaviour if not..
+  */
++
++#ifdef CONFIG_M2_SIM
++static inline int pte_bc(pte_t pte)
++{
++    // note we can't directly return the result of the
++    // following AND because the bit position is too high
++    // for the "int" return type, and the conversion would
++    // truncate the bit at _PAGE_BC
++    if (pte_val(pte) & _PAGE_BC)
++        return 1;
++    else
++        return 0;
++}
++
++static inline int pte_rw(pte_t pte)
++{
++	return pte_flags(pte) & _PAGE_RW;
++}
++
++static inline int pte_rwb(pte_t pte)
++{
++	if (pte_val(pte) & _PAGE_RWB)
++            return 1;
++        else
++            return 0;
++}
++
++#endif
++
+ static inline int pte_dirty(pte_t pte)
+ {
+ 	return pte_flags(pte) & _PAGE_DIRTY;
+@@ -104,7 +133,12 @@ static inline int pmd_young(pmd_t pmd)
+ 
+ static inline int pte_write(pte_t pte)
+ {
+-	return pte_flags(pte) & _PAGE_RW;
++#ifdef CONFIG_M2_SIM
++        if (pte_bc(pte))
++            return pte_rwb(pte);
++        else
++#endif
++            return pte_rw(pte);
+ }
+ 
+ static inline int pte_file(pte_t pte)
+@@ -195,9 +229,37 @@ static inline pte_t pte_mkold(pte_t pte)
+ 	return pte_clear_flags(pte, _PAGE_ACCESSED);
+ }
+ 
++#ifdef CONFIG_M2_SIM
++
++static inline pte_t pte_bcoff(pte_t pte)
++{
++        if (pte_rwb(pte))
++            pte = pte_set_flags(pte, _PAGE_RW);
++        else
++            pte = pte_clear_flags(pte, _PAGE_RW);
++        pte = pte_clear_flags(pte, _PAGE_RWB);
++	return pte_clear_flags(pte, _PAGE_BC);
++}
++
++static inline pte_t pte_bcon(pte_t pte)
++{
++        if (pte_rw(pte))
++            pte = pte_set_flags(pte, _PAGE_RWB);
++        else
++            pte = pte_clear_flags(pte, _PAGE_RWB);
++        pte = pte_clear_flags(pte, _PAGE_RW);
++	return pte_set_flags(pte, _PAGE_BC);
++}
++#endif
++
+ static inline pte_t pte_wrprotect(pte_t pte)
+ {
+-	return pte_clear_flags(pte, _PAGE_RW);
++#ifdef CONFIG_M2_SIM
++        if (pte_bc(pte))
++            return pte_clear_flags(pte, _PAGE_RWB);
++        else
++#endif
++            return pte_clear_flags(pte, _PAGE_RW);
+ }
+ 
+ static inline pte_t pte_mkexec(pte_t pte)
+@@ -217,7 +279,12 @@ static inline pte_t pte_mkyoung(pte_t pte)
+ 
+ static inline pte_t pte_mkwrite(pte_t pte)
+ {
+-	return pte_set_flags(pte, _PAGE_RW);
++#ifdef CONFIG_M2_SIM
++        if (pte_bc(pte))
++	    return pte_set_flags(pte, _PAGE_RWB);
++        else
++#endif
++            return pte_set_flags(pte, _PAGE_RW);
+ }
+ 
+ static inline pte_t pte_mkhuge(pte_t pte)
+diff --git a/arch/x86/include/asm/pgtable_types.h b/arch/x86/include/asm/pgtable_types.h
+index 4e700b1..4cbe92b 100644
+--- a/arch/x86/include/asm/pgtable_types.h
++++ b/arch/x86/include/asm/pgtable_types.h
+@@ -8,6 +8,8 @@
+ 
+ #define _PAGE_BIT_PRESENT	0	/* is present */
+ #define _PAGE_BIT_RW		1	/* writeable */
++#define _PAGE_BIT_RWB           52      /* writeable backup for NVM simulation */
++#define _PAGE_BIT_BC            53      /* if PTE is in NVM backed clean state */
+ #define _PAGE_BIT_USER		2	/* userspace addressable */
+ #define _PAGE_BIT_PWT		3	/* page write through */
+ #define _PAGE_BIT_PCD		4	/* page cache disabled */
+@@ -33,6 +35,8 @@
+ 
+ #define _PAGE_PRESENT	(_AT(pteval_t, 1) << _PAGE_BIT_PRESENT)
+ #define _PAGE_RW	(_AT(pteval_t, 1) << _PAGE_BIT_RW)
++#define _PAGE_BC	(_AT(pteval_t, 1) << _PAGE_BIT_BC)
++#define _PAGE_RWB     	(_AT(pteval_t, 1) << _PAGE_BIT_RWB)
+ #define _PAGE_USER	(_AT(pteval_t, 1) << _PAGE_BIT_USER)
+ #define _PAGE_PWT	(_AT(pteval_t, 1) << _PAGE_BIT_PWT)
+ #define _PAGE_PCD	(_AT(pteval_t, 1) << _PAGE_BIT_PCD)
+diff --git a/include/linux/badger_trap.h b/include/linux/badger_trap.h
+index 8671509..7fa0365 100644
+--- a/include/linux/badger_trap.h
++++ b/include/linux/badger_trap.h
+@@ -9,4 +9,10 @@ inline int is_pte_reserved(pte_t pte);
+ inline pmd_t pmd_mkreserve(pmd_t pmd);
+ inline pmd_t pmd_unreserve(pmd_t pmd);
+ inline int is_pmd_reserved(pmd_t pmd);
++
++typedef enum poison_type{
++    POISON_FAIL,
++    POISON_DISCARD,
++    POISON_NORM
++} poison_type;
+ #endif /* _LINUX_BADGER_TRAP_H */
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 56b20c3..fdafaf2 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -968,6 +968,18 @@ extern void *mem_cgroup_name(struct mem_cgroup *);
+ extern void increment_cold_pages_referenced(struct mem_cgroup *);
+ #endif
+ 
++#ifdef CONFIG_M2_SIM
++void bgpp_access_cold_page(struct page *, struct mem_cgroup *);
++void bgpp_bc_write(void);
++extern unsigned long bgpp_poison_anon;
++extern unsigned long bgpp_poison_anon_s;
++extern unsigned long bgpp_poison_file;
++extern unsigned long bgpp_poison_file_s;
++extern unsigned long bgpp_poison_file_f;
++extern unsigned long bgpp_poison_file_ff;
++extern unsigned long bgpp_page_not_mapped;
++#endif
++
+ #ifdef CONFIG_MEMCG_PGFAULT_HISTOGRAM
+ void mem_cgroup_pgfault_record(struct task_struct *p, u64 latency_ns,
+ 			       int fault);
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 7b32dcf..b4c8d8e 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -184,7 +184,53 @@ struct page {
+ #ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
+ 	int _last_cpupid;
+ #endif
++
++#ifdef CONFIG_M2_SIM
++        unsigned int sim_status;
++        /* bit 0: T1 page in DRAM
++         * bit 1: T2 page in DRAM
++         * bit 2: file-backed page in NVM
++         * bit 3: page in NVM write buffer
++         * bit 4: T1 task evicted this page
++         * bit 5: T2 task evicted this page
++         */
++        struct list_head  m_list;     // for fifo queue
++        unsigned long tsc;          // time stamp counter
++#endif
+ }
++
++#ifdef CONFIG_M2_SIM
++
++#define CLR_T1T2(p) { p->sim_status &= 0xffffffcc; }
++#define CLR_FBWB(p) { p->sim_status &= 0xfffffff3; }
++#define CLR_T1T2WB(p)  { p->sim_status &= 0xfffffff4; }
++#define CLR_ALL(p)  { p->sim_status &= 0x0; }
++
++#define GET_T1(p)   ( p->sim_status &  0x1 )
++#define CLR_T1(p)   { p->sim_status &= 0xfffffffe; }
++#define SET_T1(p)   { p->sim_status =  0x1; }
++#define EVT_T1(p)   ( p->sim_status &  0x10 )
++
++#define GET_T2(p)   ( p->sim_status &  0x2 )
++#define CLR_T2(p)   { p->sim_status &= 0xfffffffd; }
++#define SET_T2(p)   { p->sim_status =  0x2; }
++#define EVT_T2(p)   ( p->sim_status &  0x20 )
++
++#define GET_FB(p)   ( p->sim_status &  0x4 )
++#define CLR_FB(p)   { p->sim_status &= 0xfffffffb; }
++#define SET_FB(p)   { p->sim_status |= 0x4; }
++
++#define GET_WB(p)   ( p->sim_status &  0x8 )
++#define CLR_WB(p)   { p->sim_status &= 0xfffffff7; }
++
++#define SET_WB(p, t) ({ \
++    if (t == 1) \
++        p->sim_status |= 0x18; \
++    else \
++        p->sim_status |= 0x28; \
++})
++#endif
++
+ /*
+  * The struct page can be forced to be double word aligned so that atomic ops
+  * on double words work. The SLUB allocator can make use of such a feature.
+diff --git a/include/linux/rmap.h b/include/linux/rmap.h
+index 0a48913..7ff016e 100644
+--- a/include/linux/rmap.h
++++ b/include/linux/rmap.h
+@@ -9,6 +9,7 @@
+ #include <linux/mm.h>
+ #include <linux/rwsem.h>
+ #include <linux/memcontrol.h>
++#include <linux/badger_trap.h>
+ 
+ /*
+  * The anon_vma heads a list of private "related" vmas, to scan if
+@@ -200,7 +201,7 @@ int page_referenced_one(struct page *, struct vm_area_struct *,
+ 			struct page_referenced_info *info);
+ 
+ #ifdef CONFIG_POISON_COLD_PAGE_PTE
+-int page_poison_pte(struct page *, int is_locked, struct mem_cgroup *memcg);
++poison_type page_poison_pte(struct page *, int is_locked, struct mem_cgroup *memcg);
+ #endif
+ 
+ #define TTU_ACTION(x) ((x) & TTU_ACTION_MASK)
+diff --git a/mm/Gconfig b/mm/Gconfig
+index 589c3c8..7c615de 100644
+--- a/mm/Gconfig
++++ b/mm/Gconfig
+@@ -2,3 +2,6 @@ CONFIG_KSTALED=y
+ CONFIG_KSAMPD=y
+ x86:CONFIG_MEMCG_PGFAULT_HISTOGRAM=y
+ x86:CONFIG_POISON_COLD_PAGE_PTE=y
++x86:CONFIG_M2_SIM=y
++# CONFIG_COMPACTION is not set
++# CONFIG_TRANSPARENT_HUGEPAGE is not set
+diff --git a/mm/Kconfig b/mm/Kconfig
+index c295cbe..d374f46 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -235,13 +235,13 @@ config BALLOON_COMPACTION
+ 
+ #
+ # support for memory compaction
+-config COMPACTION
+-	bool "Allow for memory compaction"
+-	def_bool y
+-	select MIGRATION
+-	depends on MMU
+-	help
+-	  Allows the compaction of memory for the allocation of huge pages.
++#config COMPACTION
++#	bool "Allow for memory compaction"
++#	def_bool y
++#	select MIGRATION
++#	depends on MMU
++#	help
++#	  Allows the compaction of memory for the allocation of huge pages.
+ 
+ #
+ # support for page migration
+@@ -569,6 +569,17 @@ config POISON_COLD_PAGE_PTE
+ 	  delay. This feature is used to simulate the behavior of putting cold
+ 	  pages into a slower memory.
+ 
++config M2_SIM
++	depends on X86 && MMU && KSTALED && 64BIT && !KSM
++	bool "Per-cgroup m2 simulation"
++	help
++	  This feature allows the kernel to mimic the behavior of NVM used as
++          second tier memory. It relies on kstaled to monitor working set size
++          of tier 1 and tier 2 tasks, and manages their pages. Accesses to
++          pages in NVM are intercepted using the poison mechanism, in which
++          routine the book-keeping of page management and delay injection
++          happen.
++
+ config KSAMPD
+ 	bool "Per-cgroup idle page compression sampling"
+ 	depends on KSTALED && ZSWAP
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 66d1c20..a1ed716 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -78,6 +78,11 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/memcontrol.h>
+ 
++#ifdef CONFIG_M2_SIM
++#include <linux/hashtable.h>
++#include <linux/list.h>
++#endif
++
+ struct cgroup_subsys mem_cgroup_subsys __read_mostly;
+ EXPORT_SYMBOL(mem_cgroup_subsys);
+ 
+@@ -622,6 +627,11 @@ struct mem_cgroup {
+ 	atomic_long_t cold_pages_poisoned;
+ #endif
+ 
++#ifdef CONFIG_M2_SIM
++        int bgpp_job_tier;
++        int clear_stats;
++#endif
++
+ #ifdef CONFIG_KSAMPD
+ 	struct {
+ 		s64 rs;
+@@ -671,6 +681,680 @@ enum {
+ #define KMEM_ACCOUNTED_MASK \
+ 		((1 << KMEM_ACCOUNTED_ACTIVE) | (1 << KMEM_ACCOUNTED_ACTIVATED))
+ 
++#ifdef CONFIG_M2_SIM
++
++static __inline__ unsigned long rdtsc(void)
++{
++    unsigned hi, lo;
++    asm volatile ("rdtsc" : "=a"(lo), "=d"(hi));
++    return ( (unsigned long)lo)|( ((unsigned long)hi)<<32 );
++}
++
++DEFINE_SPINLOCK(bgpp_t1_lock);
++DEFINE_SPINLOCK(bgpp_t2_lock);
++DEFINE_SPINLOCK(bgpp_wb_lock);
++
++static LIST_HEAD(t1_page_list);
++static LIST_HEAD(t2_page_list);
++static LIST_HEAD(nvm_wrbuff_list);
++
++// size in number of pages
++static unsigned long bgpp_dram_size = 0;
++static unsigned long bgpp_t2min_alloc = 0;
++static unsigned long bgpp_read_latency = 0;
++static unsigned long bgpp_write_latency = 0;
++static unsigned long bgpp_wrbuff_size = 0;
++// enable bgpp to mark cold pages
++static unsigned long bgpp_mark_cold = 0;
++
++// probability prioritize T1 eviction
++static unsigned long bgpp_t1_frac= 1;
++static atomic_long_t bgpp_evict_cnt;
++/* if bgpp_t1_frac == X, prioritize evicting t1 pages
++ * once every X-1 times. If bgpp_t1_frac == 1, always
++ * prioritize evicting t1 */
++
++// maximum percentage of write buffer T2 tasks can take
++static unsigned long bgpp_wrbuff_t2frac = 1;
++/* Page evicted by T2 tasks can take at most 1/X of
++ * total write buffer size */
++
++// total number of t1 and t2 pages
++static unsigned long bgpp_t1_pnum = 0;
++static unsigned long bgpp_t2_pnum = 0;
++// number of t1 and t2 pages in dram
++static unsigned long bgpp_t1_dnum = 0;
++static unsigned long bgpp_t2_dnum = 0;
++// number of t1 and t2 allocation and reclaimation
++static unsigned long bgpp_t1_alloc = 0;
++static unsigned long bgpp_t2_alloc = 0;
++static unsigned long bgpp_t1_reclm = 0;
++static unsigned long bgpp_t2_reclm = 0;
++// number of t1 and t2 eviction
++static unsigned long bgpp_t1_evict = 0;
++static unsigned long bgpp_t2_evict = 0;
++
++// number of pages in the write buffer
++static unsigned long nvm_wrbuff_t1num = 0;
++static unsigned long nvm_wrbuff_t2num = 0;
++// number of entries that were written to NVM from buffer
++static unsigned long nvm_wb_t1_retb = 0;
++static unsigned long nvm_wb_t2_retb = 0;
++static unsigned long nvm_wb_retn = 0;
++
++// number of discarded pages
++static unsigned long nvm_discard_bct1 = 0;
++static unsigned long nvm_discard_bct2 = 0;
++static unsigned long nvm_discard_errt1 = 0;
++static unsigned long nvm_discard_errt2 = 0;
++
++static unsigned long bgpp_bc_wr = 0;
++
++// number of nvm accesses
++static unsigned long bgpp_nvm_t1r = 0;
++static unsigned long bgpp_nvm_t1w = 0;
++static unsigned long bgpp_nvm_t2r = 0;
++static unsigned long bgpp_nvm_t2w = 0;
++// number of nvm write buffer hit
++static unsigned long bgpp_buff_t1hit = 0;
++static unsigned long bgpp_buff_t2hit = 0;
++static unsigned long bgpp_buff_whit = 0;
++static unsigned long bgpp_buff_fhit = 0;
++
++static unsigned long bgpp_bad_t1victim = 0;
++static unsigned long bgpp_bad_t2victim = 0;
++static unsigned long bgpp_poison_fail = 0;
++static unsigned long bgpp_evict_fail = 0;
++
++static unsigned long bgpp_cp_tick = 0; //check point
++
++static unsigned long bgpp_wrbuff_t1sum = 0;
++static unsigned long bgpp_wrbuff_t2sum = 0;
++static unsigned long bgpp_wrbuff_ln = 0;
++
++static unsigned long TICKS_PER_USEC = 2200;
++
++// forward declaration
++static struct page_cgroup *lookup_page_pc(struct page *page, bool is_hugetlb);
++static bool kstaled_grab_hugetlb_page(
++        struct page *, bool *, bool *, bool *, unsigned int *, bool *, bool *);
++static bool kstaled_grab_page(struct page *, bool *, bool *, bool *, unsigned int *);
++static inline unsigned long *kstaled_idle_stats(struct mem_cgroup *, int);
++
++#define dec_ul(x) ({\
++    x = (x<1) ? 1 : x; \
++    x -= 1; \
++})
++
++static inline void inc_wrbuff_num(struct mem_cgroup* agg_memcg) {
++    if (agg_memcg->bgpp_job_tier == 1) 
++        nvm_wrbuff_t1num += 1;
++    else
++        nvm_wrbuff_t2num += 1;
++}
++
++static inline void inc_wb_retb(struct mem_cgroup* memcg) {
++    if (memcg->bgpp_job_tier == 1) 
++        nvm_wb_t1_retb += 1;
++    else
++        nvm_wb_t2_retb += 1;
++}
++
++static inline void dec_wrbuff_num(struct page* p) {
++    if (EVT_T1(p))
++        dec_ul(nvm_wrbuff_t1num);
++    else
++        dec_ul(nvm_wrbuff_t2num);
++}
++
++static inline unsigned long nvm_wrbuff_num(void) {
++    return nvm_wrbuff_t1num + nvm_wrbuff_t2num;
++}
++
++static void update_nvm_buffer(void) {
++    struct page *curr, *tmp;
++    unsigned long flags;
++    unsigned long next_start_tsc = 0;
++    unsigned long finish_tick = 0;
++
++    // free all entries that should have finished already
++    spin_lock_irqsave(&bgpp_wb_lock, flags);
++    list_for_each_entry_safe(curr, tmp, &nvm_wrbuff_list, m_list) {
++        // assume serial writing of pages in write buffer
++        if (curr->tsc < next_start_tsc) curr->tsc = next_start_tsc;
++
++        // finish requests that are "almost finished" so we don't call
++        // nvm_write_delay for a request that only has to wait for tens
++        // of cycles. Don't introduce approximation into the next_start_tsc
++        // so error won't accumulate
++        if (curr->tsc + bgpp_write_latency*TICKS_PER_USEC*0.95 < rdtsc()) {
++            finish_tick = curr->tsc + bgpp_write_latency*TICKS_PER_USEC;
++            next_start_tsc = (next_start_tsc > finish_tick) ? next_start_tsc : finish_tick;
++            dec_wrbuff_num(curr);
++            CLR_WB(curr);
++            list_del_init(&curr->m_list);
++            if (curr->tsc > bgpp_cp_tick)
++                nvm_wb_retn += 1;
++        }
++        else {
++            break;
++        }
++    }
++    bgpp_wrbuff_ln += 1;
++    bgpp_wrbuff_t1sum += nvm_wrbuff_t1num;
++    bgpp_wrbuff_t2sum += nvm_wrbuff_t2num;
++    spin_unlock_irqrestore(&bgpp_wb_lock, flags);
++}
++
++static void nvm_read_delay(struct page* p, unsigned long start_tsc, struct mem_cgroup *memcg) {
++    unsigned long flags;
++    bool is_in_wrbuff = false;
++    bool is_head = false;
++    unsigned long next_start_tsc;
++
++    // if hit in the write buffer, skip waiting
++    spin_lock_irqsave(&bgpp_wb_lock, flags);
++    if (GET_WB(p)) {
++        // remove this entry from NVM write buffer
++        if (p == list_first_entry_or_null(&nvm_wrbuff_list, struct page, m_list)) {
++            is_head = true;
++            next_start_tsc = p->tsc + bgpp_write_latency*TICKS_PER_USEC;
++        }
++        list_del_init(&p->m_list);
++        dec_wrbuff_num(p);
++        if (memcg->bgpp_job_tier == 1)
++            bgpp_buff_t1hit += 1;
++        else if (memcg->bgpp_job_tier == 2)
++            bgpp_buff_t2hit += 1;
++        is_in_wrbuff = true;
++    }
++    CLR_FBWB(p);
++
++    if (is_head) {
++        // if hit the oldest entry in the write buffer,
++        // have to update the start time of the second oldest entry
++        struct page* head;
++        head = list_first_entry_or_null(&nvm_wrbuff_list, struct page, m_list);
++        if (head)
++            head->tsc = next_start_tsc;
++    }
++    spin_unlock_irqrestore(&bgpp_wb_lock, flags);
++
++    if (!is_in_wrbuff) {
++        while(rdtsc() - start_tsc < bgpp_read_latency * TICKS_PER_USEC) {}
++    }
++
++    return;
++}
++
++static void nvm_write_delay(struct mem_cgroup* agg_memcg) {
++    // if hit in the write buffer, skip waiting
++    // NOTE: currently this code should never run since a page can either
++    //       be in DRAM or NVM (including write buffer), but not both
++
++
++    /*wait till last entry is freed if
++        1) if list is full
++        2) if a T2 task is evicting pages and the number of victims
++        evicted by T2 exceeds limit */
++    if (nvm_wrbuff_num() >= bgpp_wrbuff_size ||
++            (agg_memcg->bgpp_job_tier == 2 && 
++             bgpp_wrbuff_t2frac*nvm_wrbuff_t2num > bgpp_wrbuff_size)) {
++        struct page* curr;
++        unsigned long finish_tick, sleep_ticks;
++        unsigned long s;
++        unsigned long flags;
++
++        spin_lock_irqsave(&bgpp_wb_lock, flags);
++        // get the oldest entry and compute when should it finish
++        curr = list_first_entry(&nvm_wrbuff_list, struct page, m_list);
++        finish_tick = curr->tsc + bgpp_write_latency*TICKS_PER_USEC;
++        sleep_ticks = finish_tick - rdtsc();
++        if (finish_tick < rdtsc()) {
++            sleep_ticks = 0;
++        }
++        dec_wrbuff_num(curr);
++        CLR_WB(curr);
++        list_del_init(&curr->m_list);
++        inc_wb_retb(agg_memcg);
++
++        // update the starting time of the next entry
++        curr = list_first_entry_or_null(&nvm_wrbuff_list, struct page, m_list);
++        if (curr && curr->tsc < finish_tick) curr->tsc = finish_tick;
++
++        spin_unlock_irqrestore(&bgpp_wb_lock, flags);
++
++        // inject delay till this request should have finished
++        s = rdtsc();
++        while(rdtsc() < finish_tick) {}
++    }
++}
++
++static inline unsigned long bgpp_dram_total(void) {
++    return bgpp_t1_dnum + bgpp_t2_dnum;
++}
++
++// check if the current victim is eligible for eviction
++static bool is_good_victim (
++        struct page* page, struct mem_cgroup **memcg_out, struct page_cgroup **pc_out) {
++    bool is_locked = false;
++    bool is_file = false;
++    bool ref_grabbed = false;
++    bool reclaimable = true;
++    unsigned int nr_pages = 1;
++    struct mem_cgroup *memcg = NULL;
++    struct page_cgroup *pc = NULL;
++
++    if (!kstaled_grab_page(page, &is_locked, &ref_grabbed, &is_file, &nr_pages)) {
++        if (ref_grabbed)
++            reclaimable = false;
++        else
++            return false;
++    }
++    BUG_ON(!ref_grabbed);
++
++    if (!reclaimable)
++        goto out;
++
++    /* Fish out the page memcg to check how to handle kvm. */
++    pc = lookup_page_pc(page, false);
++    if (!pc) goto out;
++
++    memcg = pc->mem_cgroup;
++
++    if (!page_rmapping(page))
++        goto out;
++
++    *memcg_out = memcg;
++    *pc_out = pc;
++
++    if (pc)
++        unlock_page_cgroup(pc);
++    return true;
++
++out:
++    if (pc)
++        unlock_page_cgroup(pc);
++    if (is_locked)
++        unlock_page(page);
++    put_page(page);
++    return false;
++}
++
++static poison_type do_poison_page(
++        struct page* page, struct mem_cgroup **memcg, struct page_cgroup **pc) {
++    poison_type ret = page_poison_pte(page, true, *memcg);
++
++    unlock_page(page);
++    put_page(page);
++
++    return ret;
++}
++
++static inline void addto_wrbuff(struct page *victim, struct mem_cgroup* agg_memcg) {
++    inc_wrbuff_num(agg_memcg);
++    SET_WB(victim, agg_memcg->bgpp_job_tier);
++    list_add_tail(&victim->m_list, &nvm_wrbuff_list);
++    victim->tsc = rdtsc();
++}
++
++static void evict_page(struct page* aggressor, struct mem_cgroup* agg_memcg) {
++    struct page *victim = NULL;
++    struct page *ite;
++    unsigned long flags;
++    struct mem_cgroup *memcg = NULL;
++    struct page_cgroup *pc = NULL;
++    unsigned long cnt;
++
++    if (!bgpp_mark_cold) return;
++
++    /*
++     * Cannot flush tlb while interrupt is disabled, so do_poison_page
++     * cannot be called while holding a spinlock, since spinlock disables
++     * interrupt. The code below try to find a victim first, and removes it
++     * from DRAM.
++     */
++
++    cnt = atomic_long_inc_return(&bgpp_evict_cnt);
++
++    if (bgpp_t2_dnum > bgpp_t2min_alloc &&
++            (cnt%bgpp_t1_frac || bgpp_t1_dnum == 0) ) {
++        // find a promising victim and remove it from list
++        int try = 5;
++        while (try) {
++            try --;
++            // grab the LRU item
++            spin_lock_irqsave(&bgpp_t2_lock, flags);
++            ite = list_first_entry_or_null(&t2_page_list, struct page, m_list);
++            if (ite == NULL) {
++                spin_unlock_irqrestore(&bgpp_t2_lock, flags);
++                break; // empty list
++            }
++            list_del_init(&ite->m_list);
++            spin_unlock_irqrestore(&bgpp_t2_lock, flags);
++
++            if (ite != aggressor && is_good_victim(ite, &memcg, &pc)) {
++                victim = ite;
++                CLR_T1T2(victim);
++
++                spin_lock_irqsave(&bgpp_wb_lock, flags);
++                // move to wrbuff before poisoning since access may happen 
++                // after poison but before moving
++                addto_wrbuff(victim, agg_memcg);
++                spin_unlock_irqrestore(&bgpp_wb_lock, flags);
++
++                break;
++            }
++            else {
++                spin_lock_irqsave(&bgpp_t2_lock, flags);
++                // put it back into MRU position
++                bgpp_bad_t2victim += 1;
++                list_add_tail(&ite->m_list, &t2_page_list);
++                spin_unlock_irqrestore(&bgpp_t2_lock, flags);
++            }
++        }
++
++        if (victim) {
++            // try poison the victim
++            poison_type ptype = do_poison_page(victim, &memcg, &pc);
++            if (ptype == POISON_FAIL) {
++                bgpp_poison_fail += 1;
++            }
++            spin_lock_irqsave(&bgpp_t2_lock, flags);
++            bgpp_t2_dnum -= 1;
++            bgpp_t2_evict += 1;
++            if (ptype == POISON_FAIL || ptype == POISON_NORM) {
++                // if poison fail, just discard that page
++                bgpp_nvm_t2w += 1;
++                spin_unlock_irqrestore(&bgpp_t2_lock, flags);
++                nvm_write_delay(agg_memcg);
++                victim->tsc = rdtsc();
++            }
++            else if (ptype == POISON_DISCARD) {
++                bool is_head = false;
++                unsigned long next_start_tsc;
++
++                spin_unlock_irqrestore(&bgpp_t2_lock, flags);
++                spin_lock_irqsave(&bgpp_wb_lock, flags);
++                if (victim == list_first_entry_or_null(&nvm_wrbuff_list, struct page, m_list)) {
++                    is_head = true;
++                    next_start_tsc = victim->tsc + bgpp_write_latency*TICKS_PER_USEC;
++                }
++                nvm_discard_bct2 += 1;
++                if (GET_WB(victim)) {
++                    list_del(&victim->m_list);
++                    dec_wrbuff_num(victim);
++                    CLR_WB(victim);
++
++                    if (is_head) {
++                        struct page* head;
++                        head = list_first_entry_or_null(&nvm_wrbuff_list, struct page, m_list);
++                        if (head)
++                            head->tsc = next_start_tsc;
++                    }
++                }
++                else {
++                    // if page not in DRAM either: inaccuracy
++                    nvm_discard_errt2 += 1;
++                }
++                spin_unlock_irqrestore(&bgpp_wb_lock, flags);
++            }
++        }
++    }
++
++    if (!victim && bgpp_t1_dnum > 0) {
++        // find a promising victim and remove it from list
++        int try = 5;
++        while (try) {
++            try --;
++            // grab the LRU item
++            spin_lock_irqsave(&bgpp_t1_lock, flags);
++            ite = list_first_entry_or_null(&t1_page_list, struct page, m_list);
++            if (ite == NULL) {
++                spin_unlock_irqrestore(&bgpp_t1_lock, flags);
++                break; // empty list
++            }
++            list_del_init(&ite->m_list);
++            spin_unlock_irqrestore(&bgpp_t1_lock, flags);
++
++            if (ite != aggressor && is_good_victim(ite, &memcg, &pc)) {
++                victim = ite;
++                CLR_T1T2(victim);
++
++                spin_lock_irqsave(&bgpp_wb_lock, flags);
++                // move to wrbuff before poisoning since access may happen 
++                // after poison but before moving
++                addto_wrbuff(victim, agg_memcg);
++                spin_unlock_irqrestore(&bgpp_wb_lock, flags);
++
++                break;
++            }
++            else {
++                spin_lock_irqsave(&bgpp_t1_lock, flags);
++                // put it back into MRU position
++                bgpp_bad_t1victim += 1;
++                list_add_tail(&ite->m_list, &t1_page_list);
++                spin_unlock_irqrestore(&bgpp_t1_lock, flags);
++            }
++        }
++
++        if (victim) {
++            // try poison the victim
++            poison_type ptype = do_poison_page(victim, &memcg, &pc);
++            if (ptype == POISON_FAIL) {
++                bgpp_poison_fail += 1;
++            }
++            spin_lock_irqsave(&bgpp_t1_lock, flags);
++            bgpp_t1_dnum -= 1;
++            bgpp_t1_evict += 1;
++            if (ptype == POISON_FAIL || ptype == POISON_NORM) {
++                // if poison fail, just discard that page
++                bgpp_nvm_t1w += 1;
++                spin_unlock_irqrestore(&bgpp_t1_lock, flags);
++                nvm_write_delay(agg_memcg);
++                victim->tsc = rdtsc();
++            }
++            else if (ptype == POISON_DISCARD) {
++                bool is_head = false;
++                unsigned long next_start_tsc;
++
++                spin_unlock_irqrestore(&bgpp_t1_lock, flags);
++                spin_lock_irqsave(&bgpp_wb_lock, flags);
++                if (victim == list_first_entry_or_null(&nvm_wrbuff_list, struct page, m_list)) {
++                    is_head = true;
++                    next_start_tsc = victim->tsc + bgpp_write_latency*TICKS_PER_USEC;
++                }
++                nvm_discard_bct1 += 1;
++                if (GET_WB(victim)) {
++                    list_del(&victim->m_list);
++                    dec_wrbuff_num(victim);
++                    CLR_WB(victim);
++
++                    if (is_head) {
++                        struct page* head;
++                        head = list_first_entry_or_null(&nvm_wrbuff_list, struct page, m_list);
++                        if (head)
++                            head->tsc = next_start_tsc;
++                    }
++                }
++                else {
++                    // if page not in DRAM either: inaccuracy
++                    nvm_discard_errt1 += 1;
++                }
++                spin_unlock_irqrestore(&bgpp_wb_lock, flags);
++            }
++        }
++    }
++
++    if (!victim) {
++        bgpp_evict_fail += 1;
++    }
++
++    return;
++}
++
++static inline void fill_empty_page(void) {
++    return;
++}
++
++static void bgpp_page_alloc(struct page* p, struct mem_cgroup *memcg) {
++    unsigned long tsc = rdtsc();
++    unsigned long flags;
++
++    if (memcg == NULL || memcg->bgpp_job_tier == 0) return;
++
++    update_nvm_buffer();
++
++    if (bgpp_dram_total() >= bgpp_dram_size)
++        evict_page(p, memcg);
++
++    //XXX: following code should be moved to elsewhere
++    if (GET_FB(p)) {
++        if (GET_WB(p)) {
++            unsigned long flags_wb;
++            spin_lock_irqsave(&bgpp_wb_lock, flags_wb);
++            if (GET_WB(p)) {
++                list_del_init(&p->m_list);
++                dec_wrbuff_num(p);
++                CLR_FBWB(p);
++                bgpp_buff_fhit += 1;
++            }
++            // no need to flush the tlb
++            spin_unlock_irqrestore(&bgpp_wb_lock, flags_wb);
++        }
++        else {
++            nvm_read_delay(p, tsc, memcg);
++        }
++    }
++    if (GET_T1(p) || GET_T2(p)){
++        WARN_ON(1);
++        return;
++    }
++
++    if (memcg->bgpp_job_tier == 1) {
++        spin_lock_irqsave(&bgpp_t1_lock, flags);
++        if (GET_T1(p)) {
++            spin_unlock_irqrestore(&bgpp_t1_lock, flags);
++            return;
++        }
++        SET_T1(p);
++        list_add_tail(&p->m_list, &t1_page_list);
++        bgpp_t1_pnum += 1;
++        bgpp_t1_alloc += 1;
++        bgpp_t1_dnum += 1;
++        spin_unlock_irqrestore(&bgpp_t1_lock, flags);
++    }
++    else if (memcg->bgpp_job_tier == 2) {
++        spin_lock_irqsave(&bgpp_t2_lock, flags);
++        if (GET_T2(p)) {
++            spin_unlock_irqrestore(&bgpp_t2_lock, flags);
++            return;
++        }
++        SET_T2(p);
++        list_add_tail(&p->m_list, &t2_page_list);
++        bgpp_t2_pnum += 1;
++        bgpp_t2_alloc += 1;
++        bgpp_t2_dnum += 1;
++        spin_unlock_irqrestore(&bgpp_t2_lock, flags);
++    }
++
++    return;
++}
++
++static void bgpp_page_dealloc(struct page* p, struct mem_cgroup *memcg) {
++    unsigned long flags, wb_flags;
++
++    if (memcg == NULL || memcg->bgpp_job_tier == 0) return;
++
++    update_nvm_buffer();
++
++    if (memcg->bgpp_job_tier == 1) {
++        spin_lock_irqsave(&bgpp_t1_lock, flags);
++        dec_ul(bgpp_t1_pnum);
++        bgpp_t1_reclm += 1;
++        if (GET_T1(p)) {
++            dec_ul(bgpp_t1_dnum);
++            list_del(&p->m_list);
++        }
++        else if (GET_WB(p)) {
++            spin_lock_irqsave(&bgpp_wb_lock, wb_flags);
++            dec_wrbuff_num(p);
++            list_del(&p->m_list);
++            spin_unlock_irqrestore(&bgpp_wb_lock, wb_flags);
++        }
++        CLR_T1T2WB(p);
++        spin_unlock_irqrestore(&bgpp_t1_lock, flags);
++    }
++    else if (memcg->bgpp_job_tier == 2) {
++        spin_lock_irqsave(&bgpp_t2_lock, flags);
++        dec_ul(bgpp_t2_pnum);
++        bgpp_t2_reclm += 1;
++        if (GET_T2(p)) {
++            dec_ul(bgpp_t2_dnum);
++            list_del(&p->m_list);
++        }
++        else if (GET_WB(p)) {
++            spin_lock_irqsave(&bgpp_wb_lock, wb_flags);
++            dec_wrbuff_num(p);
++            list_del(&p->m_list);
++            spin_unlock_irqrestore(&bgpp_wb_lock, wb_flags);
++        }
++        CLR_T1T2WB(p);
++        spin_unlock_irqrestore(&bgpp_t2_lock, flags);
++    }
++
++    if ( memcg->bgpp_job_tier != 0 && bgpp_dram_total() < bgpp_dram_size )
++        fill_empty_page();
++
++    return;
++}
++
++void bgpp_bc_write(void) {
++    bgpp_bc_wr += 1;
++}
++
++void bgpp_access_cold_page(struct page* page, struct mem_cgroup* memcg) {
++    unsigned long tsc = rdtsc();
++    unsigned long flags;
++
++    if (page == NULL || !bgpp_mark_cold) return;
++
++    if (GET_T1(page) || GET_T2(page)) {
++        WARN_ON(1);
++        return;
++    }
++
++    if (memcg->bgpp_job_tier != 0) {
++        update_nvm_buffer();
++
++        if (bgpp_dram_total() >= bgpp_dram_size)
++            evict_page(page, memcg);
++
++        // mimic the delay of nvm read
++        nvm_read_delay(page, tsc, memcg);
++    }
++
++    if (memcg->bgpp_job_tier == 1) {
++        spin_lock_irqsave(&bgpp_t1_lock, flags);
++        SET_T1(page);
++        list_add_tail(&page->m_list, &t1_page_list);
++        bgpp_t1_dnum += 1;
++        bgpp_nvm_t1r += 1;
++        spin_unlock_irqrestore(&bgpp_t1_lock, flags);
++    }
++    else if (memcg->bgpp_job_tier == 2) {
++        spin_lock_irqsave(&bgpp_t2_lock, flags);
++        SET_T2(page);
++        list_add_tail(&page->m_list, &t2_page_list);
++        bgpp_t2_dnum += 1;
++        bgpp_nvm_t2r += 1;
++        spin_unlock_irqrestore(&bgpp_t2_lock, flags);
++    }
++
++    return;
++}
++#endif
++
+ #ifdef CONFIG_MEMCG_KMEM
+ static inline void memcg_kmem_set_active(struct mem_cgroup *memcg)
+ {
+@@ -6866,6 +7550,10 @@ static int mem_cgroup_charge_common(struct page *page, struct mm_struct *mm,
+ 	if (ret == -ENOMEM)
+ 		return ret;
+ 	__mem_cgroup_commit_charge(memcg, page, nr_pages, ctype, false);
++
++#ifdef CONFIG_M2_SIM
++        bgpp_page_alloc(page, memcg);
++#endif
+ 	return 0;
+ }
+ 
+@@ -7189,6 +7877,9 @@ __mem_cgroup_uncharge_common(struct page *page, enum charge_type ctype,
+ 		break;
+ 	}
+ 
++#ifdef CONFIG_M2_SIM
++        bgpp_page_dealloc(page, memcg);
++#endif
+ 	mem_cgroup_charge_statistics(memcg, page, anon, -nr_pages);
+ 
+ 	kstaled_clear_stale(pc, page);
+@@ -9991,6 +10682,326 @@ static int mem_cgroup_poison_page_delay_write(struct cgroup *cgrp,
+ }
+ #endif /* CONFIG_POISON_COLD_PAGE_PTE */
+ 
++#ifdef CONFIG_M2_SIM
++static u64 mem_cgroup_bgpp_job_tier_read(struct cgroup *cgrp,
++                                         struct cftype *cft)
++{
++        struct mem_cgroup *memcg = mem_cgroup_from_cont(cgrp);
++
++        return memcg->bgpp_job_tier;
++}
++
++static int mem_cgroup_bgpp_job_tier_write(struct cgroup *cgrp,
++                                          struct cftype *cft, u64 val)
++{
++        struct mem_cgroup *memcg = mem_cgroup_from_cont(cgrp);
++
++        memcg->bgpp_job_tier = val;
++
++        return 0;
++}
++
++static u64 mem_cgroup_bgpp_clear_stats_read(struct cgroup *cgrp,
++                                         struct cftype *cft)
++{
++        struct mem_cgroup *memcg = mem_cgroup_from_cont(cgrp);
++
++        return memcg->clear_stats;
++}
++
++static int mem_cgroup_bgpp_clear_stats_write(struct cgroup *cgrp,
++                                          struct cftype *cft, u64 val)
++{
++        struct mem_cgroup *memcg = mem_cgroup_from_cont(cgrp);
++        memcg->clear_stats = val;
++
++        if (val != 0) {
++            struct page *curr, *tmp;
++            unsigned long flags1, flags2, flags3;
++
++            spin_lock_irqsave(&bgpp_t1_lock, flags1);
++            spin_lock_irqsave(&bgpp_t2_lock, flags2);
++            spin_lock_irqsave(&bgpp_wb_lock, flags3);
++
++            bgpp_bad_t1victim = 0;
++            bgpp_bad_t2victim = 0;
++            bgpp_poison_fail = 0;
++            bgpp_evict_fail = 0 ;
++            nvm_wb_t1_retb = 0;
++            nvm_wb_t2_retb = 0;
++            nvm_wb_retn = 0;
++            nvm_discard_bct1 = 0;
++            nvm_discard_bct2 = 0;
++            nvm_discard_errt1 = 0;
++            nvm_discard_errt2 = 0;
++            bgpp_bc_wr = 0;
++            bgpp_nvm_t1r = 0;
++            bgpp_nvm_t1w = 0;
++            bgpp_nvm_t2r = 0;
++            bgpp_nvm_t2w = 0;
++            bgpp_buff_t1hit = 0;
++            bgpp_buff_t2hit = 0;
++            bgpp_buff_whit = 0;
++            bgpp_buff_fhit = 0;
++            bgpp_wrbuff_t1sum = 0;
++            bgpp_wrbuff_t2sum = 0;
++            bgpp_wrbuff_ln = 1;
++            bgpp_t1_evict = 0;
++            bgpp_t2_evict = 0;
++
++            if (val == 1) {
++                bgpp_t1_pnum = 0;
++                bgpp_t2_pnum = 0;
++                bgpp_t1_dnum = 0;
++                bgpp_t2_dnum = 0;
++                bgpp_t1_alloc = 0;
++                bgpp_t2_alloc = 0;
++                bgpp_t1_reclm = 0;
++                bgpp_t2_reclm = 0;
++                nvm_wrbuff_t1num = 0;
++                nvm_wrbuff_t2num = 0;
++
++                list_for_each_entry_safe(curr, tmp, &t1_page_list, m_list) {
++                    CLR_ALL(curr);
++                    list_del(&curr->m_list);
++                }
++
++                list_for_each_entry_safe(curr, tmp, &t2_page_list, m_list) {
++                    CLR_ALL(curr);
++                    list_del(&curr->m_list);
++                }
++
++                list_for_each_entry_safe(curr, tmp, &nvm_wrbuff_list, m_list) {
++                    CLR_ALL(curr);
++                    list_del(&curr->m_list);
++                }
++            }
++            spin_unlock_irqrestore(&bgpp_wb_lock, flags3);
++            spin_unlock_irqrestore(&bgpp_t2_lock, flags2);
++            spin_unlock_irqrestore(&bgpp_t1_lock, flags1);
++        }
++
++        return 0;
++}
++
++static u64 mem_cgroup_bgpp_dram_size_read(struct cgroup *cgrp,
++                                         struct cftype *cft)
++{
++        return bgpp_dram_size;
++}
++
++static int mem_cgroup_bgpp_dram_size_write(struct cgroup *cgrp,
++                                          struct cftype *cft, u64 val)
++{
++        bgpp_dram_size = val;
++
++        return 0;
++}
++
++static u64 mem_cgroup_bgpp_mark_cold_read(struct cgroup *cgrp,
++                                          struct cftype *cft)
++{
++        return bgpp_mark_cold;
++}
++
++static int mem_cgroup_bgpp_mark_cold_write(struct cgroup *cgrp,
++                                           struct cftype *cft, u64 val)
++{
++        bgpp_mark_cold = val;
++
++        return 0;
++}
++
++static u64 mem_cgroup_bgpp_wrbuff_t2frac_read(struct cgroup *cgrp,
++                                             struct cftype *cft)
++{
++        return bgpp_wrbuff_t2frac;
++}
++
++static int mem_cgroup_bgpp_wrbuff_t2frac_write(struct cgroup *cgrp,
++                                              struct cftype *cft, u64 val)
++{
++        if (val == 0) {
++            printk("bgpp_wrbuff_t2frac should be at least 1\n");
++            WARN_ON(1);
++            val = 1;
++        }
++        bgpp_wrbuff_t2frac = val;
++
++        return 0;
++}
++
++
++static u64 mem_cgroup_bgpp_t1_frac_read(struct cgroup *cgrp,
++                                             struct cftype *cft)
++{
++        return bgpp_t1_frac;
++}
++
++static int mem_cgroup_bgpp_t1_frac_write(struct cgroup *cgrp,
++                                              struct cftype *cft, u64 val)
++{
++        if (val == 0) {
++            printk("bgpp_t1_frac should be at least 1\n");
++            WARN_ON(1);
++            val = 1;
++        }
++        bgpp_t1_frac = val;
++
++        return 0;
++}
++
++static u64 mem_cgroup_bgpp_t2min_alloc_read(struct cgroup *cgrp,
++                                             struct cftype *cft)
++{
++        return bgpp_t2min_alloc;
++}
++
++static int mem_cgroup_bgpp_t2min_alloc_write(struct cgroup *cgrp,
++                                              struct cftype *cft, u64 val)
++{
++        bgpp_t2min_alloc = val;
++
++        return 0;
++}
++
++static u64 mem_cgroup_bgpp_read_latency_read(struct cgroup *cgrp,
++                                             struct cftype *cft)
++{
++        return bgpp_read_latency;
++}
++
++static int mem_cgroup_bgpp_read_latency_write(struct cgroup *cgrp,
++                                              struct cftype *cft, u64 val)
++{
++        bgpp_read_latency = val;
++
++        return 0;
++}
++
++static u64 mem_cgroup_bgpp_write_latency_read(struct cgroup *cgrp,
++                                              struct cftype *cft)
++{
++        return bgpp_write_latency;
++}
++
++static int mem_cgroup_bgpp_write_latency_write(struct cgroup *cgrp,
++                                               struct cftype *cft, u64 val)
++{
++        bgpp_write_latency = val;
++
++        return 0;
++}
++
++static u64 mem_cgroup_bgpp_wrbuff_size_read(struct cgroup *cgrp,
++                                              struct cftype *cft)
++{
++        return bgpp_wrbuff_size;
++}
++
++static int mem_cgroup_bgpp_wrbuff_size_write(struct cgroup *cgrp,
++                                               struct cftype *cft, u64 val)
++{
++        bgpp_wrbuff_size = val;
++
++        return 0;
++}
++
++static u64 mem_cgroup_bgpp_dump_read(struct cgroup *cgrp,
++                                              struct cftype *cft)
++{
++        return 0;
++}
++
++static int mem_cgroup_bgpp_dump_write(struct cgroup *cgrp,
++                                               struct cftype *cft, u64 val)
++{
++    unsigned long flags1, flags2, flags3;
++    if (val != 0) {
++        unsigned long wr_mb, rd_mb;
++        unsigned long t1_wr_mb, t2_wr_mb;
++        unsigned long t1_rd_mb, t2_rd_mb;
++        unsigned long time_in_s, time_in_ms;
++
++        spin_lock_irqsave(&bgpp_t1_lock, flags1);
++        spin_lock_irqsave(&bgpp_t2_lock, flags2);
++        spin_lock_irqsave(&bgpp_wb_lock, flags3);
++
++        wr_mb = (nvm_wb_t1_retb + nvm_wb_t2_retb + nvm_wb_retn) * 4 / 1024;
++        rd_mb = (bgpp_nvm_t1r + bgpp_nvm_t2r - bgpp_buff_t1hit - bgpp_buff_t2hit) * 4 / 1024;
++        t1_wr_mb = (bgpp_nvm_t1w - bgpp_buff_t1hit) * 4 / 1024;
++        t2_wr_mb = (bgpp_nvm_t2w - bgpp_buff_t2hit) * 4 / 1024;
++        t1_rd_mb = (bgpp_nvm_t1r - bgpp_buff_t1hit) * 4 / 1024;
++        t2_rd_mb = (bgpp_nvm_t2r - bgpp_buff_t2hit) * 4 / 1024;
++        time_in_s  = (rdtsc() - bgpp_cp_tick) / TICKS_PER_USEC / 1000000;
++        time_in_ms = (rdtsc() - bgpp_cp_tick) / TICKS_PER_USEC / 1000;
++
++        bgpp_cp_tick = rdtsc();
++        printk("tsc: %lu, time_in_ms: %lu\n",
++                bgpp_cp_tick, time_in_ms);
++        printk("dram_total: %lu; dram_size: %lu\n",
++                bgpp_dram_total(), bgpp_dram_size);
++        printk("bgpp_t1_pnum: %lu; bgpp_t2_pnum: %lu\n",
++                bgpp_t1_pnum, bgpp_t2_pnum);
++        printk("bgpp_t1_dnum: %lu; bgpp_t2_dnum: %lu\n",
++                bgpp_t1_dnum, bgpp_t2_dnum);
++        printk("alloc_t1_num: %lu; alloc_t2_num: %lu\n",
++                bgpp_t1_alloc, bgpp_t2_alloc);
++        printk("reclm_t1_num: %lu; reclm_t2_num: %lu\n",
++                bgpp_t1_reclm, bgpp_t2_reclm);
++        printk("evict_t1_num: %lu; evict_t2_num: %lu\n",
++                bgpp_t1_evict, bgpp_t2_evict);
++        printk("t1_dram_pcnt: %lu; t2_dram_pcnt: %lu\n",
++                100*bgpp_t1_dnum/bgpp_dram_size, 100*bgpp_t2_dnum/bgpp_dram_size);
++        printk("bad_t1_victim: %lu; bad_t2_victim: %lu\n",
++                bgpp_bad_t1victim, bgpp_bad_t2victim);
++        printk("poison_fail: %lu; evict_fail: %lu\n", bgpp_poison_fail, bgpp_evict_fail);
++        printk("wrbuff_t1avg x10: %lu, wrbuff_t2avg x10: %lu\n",
++                10*bgpp_wrbuff_t1sum/bgpp_wrbuff_ln, 10*bgpp_wrbuff_t2sum/bgpp_wrbuff_ln);
++        printk("nvm_t1r: %lu; nvm_t1w: %lu\n",
++                bgpp_nvm_t1r, bgpp_nvm_t1w);
++        printk("nvm_t2r: %lu; nvm_t2w: %lu\n",
++                bgpp_nvm_t2r, bgpp_nvm_t2w);
++        printk("buff_t1hit: %lu; buff_t2hit: %lu\n",
++                bgpp_buff_t1hit, bgpp_buff_t2hit);
++        printk("t1_wb_retb: %lu; t2_wb_retb: %lu\n", 
++                nvm_wb_t1_retb, nvm_wb_t2_retb);
++        printk("wb_retn: %lu\n", nvm_wb_retn);
++        printk("discard_bct1: %lu; discard_errt1: %lu\n", 
++                nvm_discard_bct1, nvm_discard_errt1);
++        printk("discard_bct2: %lu; discard_errt2: %lu\n", 
++                nvm_discard_bct2, nvm_discard_errt2);
++        printk("bgpp_bc_wr: %lu\n", bgpp_bc_wr);
++        printk("write BW: %lu, read BW: %lu\n", 
++                (unsigned long) (wr_mb / (time_in_s+0.1)), (unsigned long) (rd_mb / (time_in_s+0.1)) );
++        printk("t1 write WB: %lu, t1 read BW: %lu\n", 
++                (unsigned long) (t1_wr_mb / (time_in_s+0.1)), (unsigned long) (t1_rd_mb / (time_in_s+0.1)) );
++        printk("t2 write WB: %lu, t2 read BW: %lu\n", 
++                (unsigned long) (t2_wr_mb / (time_in_s+0.1)), (unsigned long) (t2_rd_mb / (time_in_s+0.1)) );
++
++        printk("\n");
++        spin_unlock_irqrestore(&bgpp_wb_lock, flags3);
++        spin_unlock_irqrestore(&bgpp_t2_lock, flags2);
++        spin_unlock_irqrestore(&bgpp_t1_lock, flags1);
++    }
++    return 0;
++}
++
++static u64 mem_cgroup_bgpp_ticks_perus_read(struct cgroup *cgrp,
++                                              struct cftype *cft)
++{
++        return TICKS_PER_USEC;
++}
++
++static int mem_cgroup_bgpp_ticks_perus_write(struct cgroup *cgrp,
++                                               struct cftype *cft, u64 val)
++{
++    TICKS_PER_USEC = val;
++    return 0;
++}
++
++#endif /*CONFIG_M2_SIM */
++
+ #ifdef CONFIG_KSAMPD
+ 
+ #define KSAMPD_MAX_SAMPLING_RATIO	100
+@@ -10380,6 +11391,68 @@ static struct cftype mem_cgroup_files[] = {
+ 		.write_u64 = mem_cgroup_poison_page_delay_write,
+ 	},
+ #endif
++#ifdef CONFIG_M2_SIM
++        {
++                .name = "bgpp_job_tier",
++                .read_u64 = mem_cgroup_bgpp_job_tier_read,
++                .write_u64 = mem_cgroup_bgpp_job_tier_write,
++        },
++        {
++                .name = "bgpp_clear_stats",
++                .read_u64 = mem_cgroup_bgpp_clear_stats_read,
++                .write_u64 = mem_cgroup_bgpp_clear_stats_write,
++        },
++        {
++                .name = "bgpp_mark_cold",
++                .read_u64  = mem_cgroup_bgpp_mark_cold_read,
++                .write_u64 = mem_cgroup_bgpp_mark_cold_write,
++        },
++        {
++                .name = "bgpp_t1_frac",
++                .read_u64  = mem_cgroup_bgpp_t1_frac_read,
++                .write_u64 = mem_cgroup_bgpp_t1_frac_write,
++        },
++        {
++                .name = "bgpp_wrbuff_t2frac",
++                .read_u64  = mem_cgroup_bgpp_wrbuff_t2frac_read,
++                .write_u64 = mem_cgroup_bgpp_wrbuff_t2frac_write,
++        },
++        {
++                .name = "bgpp_dram_size",
++                .read_u64 = mem_cgroup_bgpp_dram_size_read,
++                .write_u64 = mem_cgroup_bgpp_dram_size_write,
++        },
++        {
++                .name = "bgpp_t2min",
++                .read_u64 = mem_cgroup_bgpp_t2min_alloc_read,
++                .write_u64 = mem_cgroup_bgpp_t2min_alloc_write,
++        },
++        {
++                .name = "bgpp_read_latency",
++                .read_u64  = mem_cgroup_bgpp_read_latency_read,
++                .write_u64 = mem_cgroup_bgpp_read_latency_write,
++        },
++        {
++                .name = "bgpp_write_latency",
++                .read_u64  = mem_cgroup_bgpp_write_latency_read,
++                .write_u64 = mem_cgroup_bgpp_write_latency_write,
++        },
++        {
++                .name = "bgpp_wrbuff_size",
++                .read_u64  = mem_cgroup_bgpp_wrbuff_size_read,
++                .write_u64 = mem_cgroup_bgpp_wrbuff_size_write,
++        },
++        {
++                .name = "bgpp_dump",
++                .read_u64  = mem_cgroup_bgpp_dump_read,
++                .write_u64 = mem_cgroup_bgpp_dump_write,
++        },
++        {
++                .name = "bgpp_ticks_perus",
++                .read_u64  = mem_cgroup_bgpp_ticks_perus_read,
++                .write_u64 = mem_cgroup_bgpp_ticks_perus_write,
++        },
++#endif
+ 	{
+ 		.name = "dirty_limit_use_soft_limit",
+ 		.read_u64 = mem_cgroup_dirty_read,
+diff --git a/mm/memory.c b/mm/memory.c
+index 65b7c29..319e06a 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -3721,13 +3721,56 @@ out:
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_M2_SIM
++/* has to handle read cold page or write cold page that has system write permission */
++static int do_cold_page_fault(struct mm_struct *mm, struct vm_area_struct *vma,
++		unsigned long address, pte_t *page_table, pmd_t *pmd,
++		unsigned int flags, spinlock_t *ptl)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_task(current);
++        struct page* page;
+ 
+-#ifdef CONFIG_POISON_COLD_PAGE_PTE
++        pte_t pte = *page_table;
++        page = vm_normal_page(vma, address, pte);
++
++
++	if (flags & FAULT_FLAG_WRITE)
++            *page_table = pte_mkdirty(*page_table);
++        else
++            *page_table = pte_bcon(*page_table);
++        *page_table = pte_mkyoung(*page_table);
++        *page_table = pte_unreserve(*page_table);
++
++        flush_tlb_page(vma, address);
++
++	pte_unmap_unlock(page_table, ptl);
++
++        bgpp_access_cold_page(page, memcg);
++
++        return 0;
++}
++
++static int do_bc_write_fault(struct mm_struct *mm, struct vm_area_struct *vma,
++		unsigned long address, pte_t *page_table, pmd_t *pmd,
++		unsigned int flags, spinlock_t *ptl)
++{
++        // turn off BC, mark dirty, return
++        *page_table = pte_bcoff(*page_table);
++        *page_table = pte_mkdirty(*page_table);
++        *page_table = pte_mkyoung(*page_table);
++        flush_tlb_page(vma, address);
++	pte_unmap_unlock(page_table, ptl);
++
++        bgpp_bc_write();
++
++        return 0;
++}
++#elif CONFIG_POISON_COLD_PAGE_PTE
+ /*
+  * This function handles the fake page fault introduced to perform cold page
+  * based poisoning.
+  */
+-static int do_fake_page_fault(struct mm_struct *mm, struct vm_area_struct *vma,
++static int do_cold_page_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		unsigned long address, pte_t *page_table, pmd_t *pmd,
+ 		unsigned int flags, spinlock_t *ptl)
+ {
+@@ -3817,7 +3860,7 @@ int handle_pte_fault(struct mm_struct *mm,
+ 	 * 2. We have taken a fake page fault on a normal page.
+ 	 *	If poisoning of cold pages is enabled for the current memcg then
+ 	 *	only we introduce the delay before servicing the fake fault to
+-	 *	the cold page in do_fake_page_fault() . Otherwise, if poisoning
++	 *	the cold page in do_cold_page_fault() . Otherwise, if poisoning
+ 	 *	is not enabled for current memcg it means a fake fault has
+ 	 *	arrived on a shared page where poisoning is/was enabled from
+ 	 *	different memcg. We will service the fault by unreserving the
+@@ -3829,12 +3872,30 @@ int handle_pte_fault(struct mm_struct *mm,
+ 		entry = *page_table;
+ 		if ((flags & FAULT_FLAG_WRITE) && is_pte_reserved(entry) &&
+ 		    !pte_write(entry)) {
++                        // write cold page that has no system write permission
+ 			return do_wp_page(mm, vma, address,
+ 						pte, pmd, ptl, entry);
+ 		} else if (is_pte_reserved(entry)) {
+-			return do_fake_page_fault(mm, vma, address,
++                        // read cold page, or
++                        // write cold page that has system write permission
++			return do_cold_page_fault(mm, vma, address,
+ 						page_table, pmd, flags, ptl);
+-		}
++		} else if ((flags & FAULT_FLAG_WRITE) && !is_pte_reserved(entry) &&
++                        pte_bc(entry)) {
++                    if (pte_rwb(entry)) {
++                        // write BC page that has system write permission
++                        return do_bc_write_fault(mm, vma, address,
++						page_table, pmd, flags, ptl);
++                    }
++                    else {
++                        // write BC page that has no system write permission
++                        // turn off BC, call do_wp_page which will properly
++                        // set up the TLB
++                        *page_table = pte_bcoff(*page_table);
++                        return do_wp_page(mm, vma, address, 
++                                pte, pmd, ptl, entry);
++                    }
++                }
+ 
+ 		pte_unmap_unlock(page_table, ptl);
+ 	}
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 96c5d46..322284c 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1015,9 +1015,10 @@ out:
+ }
+ 
+ #ifdef CONFIG_POISON_COLD_PAGE_PTE
+-int page_poison_pte_one(struct page *page, struct vm_area_struct *vma)
++poison_type page_poison_pte_one(struct page *page, struct vm_area_struct *vma)
+ {
+ 	spinlock_t *ptl;
++        poison_type ret = POISON_NORM;
+ 
+ 	/* PTE address calculation */
+ 	unsigned long address = vma_address(page, vma);
+@@ -1030,43 +1031,53 @@ int page_poison_pte_one(struct page *page, struct vm_area_struct *vma)
+ 	* the lock*/
+ 	pgd = pgd_offset(vma->vm_mm, address);
+ 	if (!pgd_present(*pgd))
+-		return 0;
++		return POISON_FAIL;
+ 
+ 	pud = pud_offset(pgd, address);
+ 	if (!pud_present(*pud))
+-		return 0;
++		return POISON_FAIL;
+ 
+ 	pmd = pmd_offset(pud, address);
+ 	if (!pmd_present(*pmd))
+-		return 0;
++		return POISON_FAIL;
+ 
+ 	pte = pte_offset_map(pmd, address);
+ 	if (!pte_present(*pte))
+-		return 0;
++		return POISON_FAIL;
+ 
+ 	pte = pte_offset_map_lock(vma->vm_mm, pmd, address, &ptl);
++        if (pte_bc(*pte)) {
++            *pte = pte_bcoff(*pte);
++            ret = POISON_DISCARD;
++        }
+ 	*pte = pte_mkreserve(*pte);
++
++#ifdef CONFIG_M2_SIM
++        flush_tlb_page(vma, address);
++#endif
++
+ 	pte_unmap_unlock(pte, ptl);
+ 
+-	return 1;
++	return ret;
+ 
+ }
+ 
+-static int page_poison_pte_anon(struct page *page,
++static poison_type page_poison_pte_anon(struct page *page,
+ 				struct mem_cgroup *memcg)
+ {
+ 	struct anon_vma *anon_vma;
+ 	pgoff_t pgoff;
+ 	struct anon_vma_chain *avc;
+-	int poisoned = 0;
++        poison_type ret = POISON_FAIL;
+ 
+ 	anon_vma = page_lock_anon_vma_read(page);
+ 	if (!anon_vma)
+-		return poisoned;
++		return ret;
+ 
+ 	pgoff = page_pgoff(page);
+ 	anon_vma_interval_tree_foreach(avc, &anon_vma->rb_root, pgoff, pgoff) {
+ 		struct vm_area_struct *vma = avc->vma;
++                poison_type t;
+ 
+ 		/*
+ 		 * If we are poisoning on behalf of a cgroup, skip
+@@ -1076,23 +1087,21 @@ static int page_poison_pte_anon(struct page *page,
+ 		if (memcg && !mm_match_cgroup(vma->vm_mm, memcg))
+ 			continue;
+ 
+-		if (page_poison_pte_one(page, vma))
+-			poisoned++;
+-		else
+-			continue;
++		t = page_poison_pte_one(page, vma);
++                ret = (ret > t) ? ret : t;
+ 	}
+ 
+ 	page_unlock_anon_vma_read(anon_vma);
+-	return poisoned;
++	return ret;
+ }
+ 
+-static int page_poison_pte_file(struct page *page,
++static poison_type page_poison_pte_file(struct page *page,
+ 				struct mem_cgroup *memcg)
+ {
+ 	struct address_space *mapping = page->mapping;
+ 	pgoff_t pgoff = page_pgoff(page);
+ 	struct vm_area_struct *vma;
+-	int poisoned = 0;
++        poison_type ret = POISON_FAIL;
+ 
+ 	/*
+ 	 * The caller's checks on page->mapping and !PageAnon have made
+@@ -1112,29 +1121,32 @@ static int page_poison_pte_file(struct page *page,
+ 	mutex_lock(&mapping->i_mmap_mutex);
+ 
+ 	vma_interval_tree_foreach(vma, &mapping->i_mmap, pgoff, pgoff) {
++                poison_type t;
+ 		/*
+ 		 * If we are poisoning on behalf of a cgroup, skip
+ 		 * counting on behalf of references from different
+ 		 * cgroups
+ 		 */
+-		if (memcg && !mm_match_cgroup(vma->vm_mm, memcg))
++		if (memcg && !mm_match_cgroup(vma->vm_mm, memcg)) {
+ 			continue;
++                }
+ 
+-		if (page_poison_pte_one(page, vma))
+-			poisoned++;
+-		else
+-			continue;
++		t = page_poison_pte_one(page, vma);
++                ret = (ret > t) ? ret : t;
+ 	}
+ 
++#ifdef CONFIG_M2_SIM
++        SET_FB(page);
++#endif
+ 	mutex_unlock(&mapping->i_mmap_mutex);
+-	return poisoned;
++	return ret;
+ }
+ 
+-int page_poison_pte(struct page *page,
++poison_type page_poison_pte(struct page *page,
+ 		      int is_locked,
+ 		      struct mem_cgroup *memcg)
+ {
+-	int poisoned = 0;
++	poison_type ret = POISON_FAIL;
+ 	int we_locked = 0;
+ 
+ 	if (page_mapped(page) && page_rmapping(page)) {
+@@ -1149,16 +1161,19 @@ int page_poison_pte(struct page *page,
+ 				goto out;
+ 		}
+ 		if (likely(!PageKsm(page))) {
+-			if (PageAnon(page))
+-				poisoned += page_poison_pte_anon(page, memcg);
+-			else if (page->mapping)
+-				poisoned += page_poison_pte_file(page, memcg);
++			if (PageAnon(page)) {
++				ret = page_poison_pte_anon(page, memcg);
++                        }
++			else if (page->mapping) {
++				ret = page_poison_pte_file(page, memcg);
++                        }
+ 		}
+-		if (we_locked)
++		if (we_locked) {
+ 			unlock_page(page);
++                }
+ 	}
+ out:
+-	return poisoned;
++	return ret;
+ }
+ #endif /* CONFIG_POISON_COLD_PAGE_PTE */
+ 
